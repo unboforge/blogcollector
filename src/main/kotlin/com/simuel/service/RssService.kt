@@ -10,6 +10,12 @@ import io.ktor.http.*
 import kotlinx.coroutines.*
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.selectAll
+import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.SortOrder
+import org.jetbrains.exposed.sql.statements.api.ExposedBlob
+import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
+import java.sql.ResultSet
 import java.time.format.DateTimeFormatter
 import kotlin.time.ExperimentalTime
 import kotlin.time.Instant
@@ -415,8 +421,13 @@ class RssService {
     /**
      * RSS 피드 수집 및 저장
      * 한국 기술 블로그 RSS URL 리스트
+     * 수집 전 데이터베이스 용량을 체크하고 필요시 자동 정리
      */
     private suspend fun collectRssFeeds() {
+        // 1. 데이터베이스 용량 체크 및 필요시 자동 정리
+        checkAndCleanupIfNeeded()
+
+        // 2. RSS 피드 수집
         val rssUrlList = createRssUrlList()
 
         if (rssUrlList.isEmpty()) {
@@ -520,6 +531,71 @@ class RssService {
 
     private fun logInvalidUrl(url: String) {
         println("유효하지 않은 RSS URL (연결 불가): $url")
+    }
+
+    /**
+     * 현재 데이터베이스 전체 크기 조회 (bytes)
+     * PostgreSQL pg_database_size() 함수 사용
+     */
+    private suspend fun getCurrentDatabaseSize(): Long {
+        return DatabaseFactory.dbQuery {
+            transaction {
+                val result = exec("SELECT pg_database_size(current_database()) as size") { rs: ResultSet ->
+                    if (rs.next()) {
+                        rs.getLong("size")
+                    } else {
+                        0L
+                    }
+                }
+                result ?: 0L
+            }
+        }
+    }
+
+    /**
+     * createdAt 기준으로 가장 오래된 블로그 포스트 N개 삭제
+     * @param count 삭제할 개수 (기본값: 50)
+     */
+    private suspend fun deleteOldestBlogPosts(count: Int = 50) {
+        DatabaseFactory.dbQuery {
+            val oldestIds = BlogPosts
+                .selectAll()
+                .orderBy(BlogPosts.createdAt to SortOrder.ASC)
+                .limit(count)
+                .map { it[BlogPosts.id] }
+
+            if (oldestIds.isNotEmpty()) {
+                val deletedCount = BlogPosts.deleteWhere { id inList oldestIds }
+                println("⚠️ 용량 관리: 가장 오래된 블로그 포스트 ${deletedCount}개 삭제 완료")
+
+                // VACUUM으로 저장공간 회수
+                transaction {
+                    exec("VACUUM ANALYZE blog_posts") { }
+                }
+                println("✅ VACUUM 완료: 저장공간 회수")
+            }
+        }
+    }
+
+    /**
+     * 데이터베이스 용량 체크 후 필요시 자동 정리
+     * 480MB 이상이면 가장 오래된 데이터 50개 삭제
+     */
+    private suspend fun checkAndCleanupIfNeeded() {
+        val currentSize = getCurrentDatabaseSize()
+        val currentSizeMB = currentSize / 1_000_000.0
+        val threshold = 480_000_000L // 480MB in bytes
+
+        println("📊 현재 데이터베이스 크기: %.2f MB".format(currentSizeMB))
+
+        if (currentSize >= threshold) {
+            println("⚠️ 용량 한계 도달 (480MB 이상): 자동 정리 시작")
+            deleteOldestBlogPosts(50)
+
+            val newSize = getCurrentDatabaseSize()
+            val newSizeMB = newSize / 1_000_000.0
+            println("✅ 정리 완료: %.2f MB → %.2f MB".format(currentSizeMB, newSizeMB))
+        }
     }
 
     /**
